@@ -229,10 +229,22 @@ while True:
         cv2.putText(frame, debug_text, (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
-        # Afficher la distance pinch (debug)
+        # Afficher la distance pinch avec indicateur visuel
         pinch_dist = get_distance(landmarks[4], landmarks[8])
-        cv2.putText(frame, f"Pinch dist: {pinch_dist:.3f}", (10, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        PINCH_THRESHOLD = 0.09
+
+        # Couleur de la barre : vert si dans la zone, rouge sinon
+        ratio = min(pinch_dist / PINCH_THRESHOLD, 1.0)  # 0.0 = pincé, 1.0 = ouvert
+        bar_color = (0, int(255 * (1 - ratio)), int(255 * ratio))  # Vert→Rouge
+
+        # Barre de progression horizontale
+        bar_x, bar_y = 10, 115
+        bar_w = 200
+        bar_filled = int(bar_w * ratio)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 15), (50, 50, 50), -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_filled, bar_y + 15), bar_color, -1)
+        cv2.putText(frame, f"Pinch: {pinch_dist:.3f} / {PINCH_THRESHOLD}", (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
 
     else:
         cv2.putText(frame, "Aucune main", (10, 40),
