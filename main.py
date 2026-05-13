@@ -1,5 +1,5 @@
-# main.py — AirCommander Phase 2
-# Objectif : reconnaissance de gestes (main ouverte, pinch, geste V)
+# main.py — AirCommander Phase 3
+# Objectif : contrôler la souris avec les gestes de la main
 
 import os
 os.environ["GLOG_minloglevel"] = "3"
@@ -10,11 +10,20 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import math
+import pyautogui
+import time
+
+# Désactive la protection anti-crash de pyautogui (déplacer souris vers coin = stop)
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0  # Pas de délai entre les actions
+
+# --- Résolution de l'écran ---
+SCREEN_W, SCREEN_H = pyautogui.size()
+print(f"Résolution écran : {SCREEN_W}x{SCREEN_H}")
 
 # --- Modèle ---
 MODEL_PATH = "hand_landmarker.task"
 
-# --- Détecteur ---
 base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
@@ -26,7 +35,7 @@ options = vision.HandLandmarkerOptions(
 )
 detector = vision.HandLandmarker.create_from_options(options)
 
-# --- Connexions pour dessiner le squelette ---
+# --- Connexions squelette ---
 CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
     (0,5),(5,6),(6,7),(7,8),
@@ -37,128 +46,93 @@ CONNECTIONS = [
 ]
 
 # ─────────────────────────────────────────────
-# FONCTIONS DE RECONNAISSANCE DE GESTES
+# PARAMÈTRES DE CONTRÔLE
+# ─────────────────────────────────────────────
+
+PINCH_THRESHOLD = 0.09      # Seuil de détection du pinch
+DEAD_ZONE       = 0.005     # Mouvement minimum pour bouger la souris
+EMA_ALPHA       = 0.5       # Lissage (0.1 = très lissé, 1.0 = brut)
+CLICK_COOLDOWN  = 0.5       # Délai minimum entre deux clics (secondes)
+
+# ─────────────────────────────────────────────
+# ÉTAT GLOBAL
+# ─────────────────────────────────────────────
+
+# Position lissée du curseur (coordonnées normalisées 0-1)
+smooth_x, smooth_y = 0.5, 0.5
+
+# Pour le scroll : position y précédente du poignet
+prev_wrist_y = None
+
+# Timestamps des derniers clics (anti-spam)
+last_left_click  = 0
+last_right_click = 0
+
+# ─────────────────────────────────────────────
+# FONCTIONS
 # ─────────────────────────────────────────────
 
 def get_fingers_state(landmarks):
-    """
-    Retourne une liste de 5 booléens indiquant si chaque doigt est levé.
-    Ordre : [pouce, index, majeur, annulaire, auriculaire]
-    """
     fingers = []
-
-    # Pouce : comparaison horizontale (x) car il est sur le côté
-    # Si le bout du pouce (4) est plus à gauche que son articulation (3) → levé
     thumb_tip = landmarks[4]
     thumb_ip  = landmarks[3]
     fingers.append(thumb_tip.x < thumb_ip.x)
 
-    # Les 4 autres doigts : comparaison verticale (y)
-    # TIP en haut (y petit) par rapport à PIP → doigt levé
-    finger_tips = [8, 12, 16, 20]   # Index, Majeur, Annulaire, Auriculaire
-    finger_pips = [6, 10, 14, 18]   # Leurs articulations PIP
-
+    finger_tips = [8, 12, 16, 20]
+    finger_pips = [6, 10, 14, 18]
     for tip, pip in zip(finger_tips, finger_pips):
         fingers.append(landmarks[tip].y < landmarks[pip].y)
-
-    return fingers  # [pouce, index, majeur, annulaire, auriculaire]
+    return fingers
 
 
 def get_distance(p1, p2):
-    """
-    Calcule la distance euclidienne entre deux landmarks (coordonnées normalisées).
-    """
     return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
 
 
 def detect_gesture(landmarks):
-    """
-    Identifie le geste principal parmi :
-    - 'PINCH'       : pouce + index rapprochés
-    - 'OPEN_HAND'   : tous les doigts levés
-    - 'FIST'        : poing fermé
-    - 'VICTORY'     : geste V (index + majeur levés)
-    - 'POINTING'    : index seul levé
-    - 'THUMBS_UP'   : pouce seul levé
-    - 'THREE'       : index + majeur + annulaire levés
-    - 'FOUR'        : tous sauf le pouce
-    - 'UNKNOWN'     : geste non reconnu
-    """
     fingers = get_fingers_state(landmarks)
-    # fingers = [pouce, index, majeur, annulaire, auriculaire]
-
-    # Distance normalisée pouce-index
     pinch_distance = get_distance(landmarks[4], landmarks[8])
 
-    # 1. PINCH : seuil relevé à 0.09 pour être plus facile à déclencher
-    if pinch_distance < 0.09:
+    if pinch_distance < PINCH_THRESHOLD:
         return "PINCH", fingers
-
-    # 2. OPEN_HAND : tous les doigts levés
     if all(fingers):
         return "OPEN_HAND", fingers
-
-    # 3. FIST : tous les doigts repliés
     if not any(fingers):
         return "FIST", fingers
-
-    # 4. VICTORY (V) : index + majeur levés, annulaire + auriculaire repliés
     if fingers[1] and fingers[2] and not fingers[3] and not fingers[4]:
         return "VICTORY", fingers
-
-    # 5. POINTING : index seul levé
     if fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
         return "POINTING", fingers
-
-    # 6. THUMBS_UP : pouce seul levé
     if fingers[0] and not fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
         return "THUMBS_UP", fingers
-
-    # 7. THREE : index + majeur + annulaire levés
     if fingers[1] and fingers[2] and fingers[3] and not fingers[4]:
         return "THREE", fingers
-
-    # 8. FOUR : index + majeur + annulaire + auriculaire levés (pouce replié)
     if not fingers[0] and fingers[1] and fingers[2] and fingers[3] and fingers[4]:
         return "FOUR", fingers
-
     return "UNKNOWN", fingers
-    """
-    Identifie le geste principal parmi :
-    - 'PINCH'       : pouce + index rapprochés
-    - 'VICTORY'     : geste V (index + majeur levés)
-    - 'OPEN_HAND'   : tous les doigts levés
-    - 'FIST'        : poing fermé
-    - 'POINTING'    : index seul levé
-    - 'UNKNOWN'     : geste non reconnu
-    """
-    fingers = get_fingers_state(landmarks)
-    # fingers = [pouce, index, majeur, annulaire, auriculaire]
 
-    # Distance normalisée pouce-index
-    pinch_distance = get_distance(landmarks[4], landmarks[8])
 
-    # 1. PINCH : pouce et index très proches
-    if pinch_distance < 0.06:
-        return "PINCH", fingers
+def apply_ema(new_x, new_y, old_x, old_y, alpha):
+    """Lissage exponentiel : réduit le tremblement du curseur."""
+    sx = alpha * new_x + (1 - alpha) * old_x
+    sy = alpha * new_y + (1 - alpha) * old_y
+    return sx, sy
 
-    # 2. OPEN_HAND : tous les doigts levés
-    if all(fingers):
-        return "OPEN_HAND", fingers
 
-    # 3. FIST : tous les doigts repliés
-    if not any(fingers):
-        return "FIST", fingers
+def move_cursor(norm_x, norm_y):
+    """Convertit les coordonnées normalisées en pixels écran et déplace la souris."""
+    # Le centre de la webcam (0.5, 0.5) correspond au centre de l'écran
+    # On amplifie les déplacements depuis le centre avec SPEED_FACTOR
+    SPEED_FACTOR = 1.8
+    centered_x = (norm_x - 0.5) * SPEED_FACTOR + 0.5
+    centered_y = (norm_y - 0.5) * SPEED_FACTOR + 0.5
 
-    # 4. VICTORY (V) : index + majeur levés, annulaire + auriculaire repliés
-    if fingers[1] and fingers[2] and not fingers[3] and not fingers[4]:
-        return "VICTORY", fingers
-
-    # 5. POINTING : index seul levé
-    if fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
-        return "POINTING", fingers
-
-    return "UNKNOWN", fingers
+    screen_x = int(centered_x * SCREEN_W)
+    screen_y = int(centered_y * SCREEN_H)
+    # Clamp pour rester dans les limites de l'écran
+    screen_x = max(0, min(SCREEN_W - 1, screen_x))
+    screen_y = max(0, min(SCREEN_H - 1, screen_y))
+    pyautogui.moveTo(screen_x, screen_y)
 
 
 # ─────────────────────────────────────────────
@@ -168,21 +142,24 @@ def detect_gesture(landmarks):
 cap = cv2.VideoCapture(0)
 frame_index = 0
 
-# Couleurs par geste (BGR)
 GESTURE_COLORS = {
-    "PINCH":     (0, 255, 0),    # Vert
-    "OPEN_HAND": (255, 200, 0),  # Bleu clair
-    "FIST":      (0, 0, 255),    # Rouge
-    "VICTORY":   (200, 0, 255),  # Violet
-    "POINTING":  (0, 255, 255),  # Jaune
-    "THUMBS_UP": (0, 165, 255),  # Orange
-    "THREE":     (255, 0, 150),  # Rose
-    "FOUR":      (150, 255, 0),  # Vert clair
-    "UNKNOWN":   (150, 150, 150) # Gris
+    "PINCH":     (0, 255, 0),
+    "OPEN_HAND": (255, 200, 0),
+    "FIST":      (0, 0, 255),
+    "VICTORY":   (200, 0, 255),
+    "POINTING":  (0, 255, 255),
+    "THUMBS_UP": (0, 165, 255),
+    "THREE":     (255, 0, 150),
+    "FOUR":      (150, 255, 0),
+    "UNKNOWN":   (150, 150, 150)
 }
-print("AirCommander Phase 2 — Reconnaissance de gestes")
-print("Gestes disponibles : PINCH | OPEN_HAND | FIST | VICTORY | POINTING")
-print("Appuie sur 'q' pour quitter")
+
+print("AirCommander Phase 3 — Contrôle souris actif")
+print("  POINTING   → déplacer le curseur")
+print("  PINCH      → clic gauche")
+print("  VICTORY    → clic droit")
+print("  FIST       → scroll (bouge la main haut/bas)")
+print("  Appuie sur 'q' pour quitter")
 
 while True:
     success, frame = cap.read()
@@ -202,55 +179,93 @@ while True:
 
     result = detector.detect_for_video(mp_image, timestamp_ms)
 
+    action_text = ""  # Message d'action affiché à l'écran
+
     if result.hand_landmarks:
         landmarks = result.hand_landmarks[0]
         points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
 
-        # Reconnaître le geste
         gesture, fingers = detect_gesture(landmarks)
         color = GESTURE_COLORS[gesture]
 
-        # Dessiner le squelette avec la couleur du geste
+        # Position brute de l'index (landmark 8) pour le curseur
+        raw_x = landmarks[8].x
+        raw_y = landmarks[8].y
+
+        # ── POINTING : déplacer le curseur ──
+        if gesture == "POINTING":
+            # Appliquer le lissage EMA
+            smooth_x, smooth_y = apply_ema(raw_x, raw_y, smooth_x, smooth_y, EMA_ALPHA)
+
+            # Appliquer la dead zone
+            dist_moved = math.sqrt((raw_x - smooth_x)**2 + (raw_y - smooth_y)**2)
+            if dist_moved > DEAD_ZONE:
+                move_cursor(smooth_x, smooth_y)
+
+            action_text = "MODE : Deplacement curseur"
+
+        # ── PINCH : clic gauche ──
+        elif gesture == "PINCH":
+            now = time.time()
+            if now - last_left_click > CLICK_COOLDOWN:
+                pyautogui.click()
+                last_left_click = now
+                action_text = ">>> CLIC GAUCHE <<<"
+            else:
+                action_text = "PINCH detecte (cooldown...)"
+
+        # ── VICTORY : clic droit ──
+        elif gesture == "VICTORY":
+            now = time.time()
+            if now - last_right_click > CLICK_COOLDOWN:
+                pyautogui.rightClick()
+                last_right_click = now
+                action_text = ">>> CLIC DROIT <<<"
+            else:
+                action_text = "VICTORY detecte (cooldown...)"
+
+        # ── FIST : scroll ──
+        elif gesture == "FIST":
+            wrist_y = landmarks[0].y  # Landmark 0 = poignet
+            if prev_wrist_y is not None:
+                delta_y = wrist_y - prev_wrist_y
+                # delta_y positif = main descend → scroll vers le bas
+                if abs(delta_y) > 0.005:  # Seuil minimal de mouvement
+                    scroll_amount = int(delta_y * -200)  # Inverser pour sens naturel
+                    pyautogui.scroll(scroll_amount)
+                    action_text = f"SCROLL {'↑' if scroll_amount > 0 else '↓'} ({scroll_amount})"
+            prev_wrist_y = wrist_y
+
+        else:
+            prev_wrist_y = None  # Reset scroll si autre geste
+
+        # Dessiner le squelette
         for start, end in CONNECTIONS:
             cv2.line(frame, points[start], points[end], color, 2)
         for x, y in points:
             cv2.circle(frame, (x, y), 4, color, -1)
 
-        # Afficher le geste détecté
-        cv2.putText(frame, f"Geste : {gesture}", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        # Affichage HUD
+        cv2.putText(frame, f"Geste : {gesture}", (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        cv2.putText(frame, action_text, (10, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        # Afficher l'état de chaque doigt (debug)
-        finger_names = ["Pouce", "Index", "Majeur", "Annulaire", "Auriculaire"]
-        debug_text = "  ".join([
-            f"{name[0]}:{'O' if state else 'X'}"
-            for name, state in zip(finger_names, fingers)
-        ])
-        cv2.putText(frame, debug_text, (10, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
-        # Afficher la distance pinch avec indicateur visuel
+        # Barre pinch
         pinch_dist = get_distance(landmarks[4], landmarks[8])
-        PINCH_THRESHOLD = 0.09
-
-        # Couleur de la barre : vert si dans la zone, rouge sinon
-        ratio = min(pinch_dist / PINCH_THRESHOLD, 1.0)  # 0.0 = pincé, 1.0 = ouvert
-        bar_color = (0, int(255 * (1 - ratio)), int(255 * ratio))  # Vert→Rouge
-
-        # Barre de progression horizontale
-        bar_x, bar_y = 10, 115
-        bar_w = 200
-        bar_filled = int(bar_w * ratio)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 15), (50, 50, 50), -1)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_filled, bar_y + 15), bar_color, -1)
-        cv2.putText(frame, f"Pinch: {pinch_dist:.3f} / {PINCH_THRESHOLD}", (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1)
+        ratio = min(pinch_dist / PINCH_THRESHOLD, 1.0)
+        bar_color = (0, int(255 * (1 - ratio)), int(255 * ratio))
+        cv2.rectangle(frame, (10, 115), (210, 130), (50, 50, 50), -1)
+        cv2.rectangle(frame, (10, 115), (10 + int(200 * ratio), 130), bar_color, -1)
+        cv2.putText(frame, f"Pinch: {pinch_dist:.3f}", (10, 112),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     else:
-        cv2.putText(frame, "Aucune main", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        cv2.putText(frame, "Aucune main", (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        prev_wrist_y = None
 
-    cv2.imshow("AirCommander - Phase 2", frame)
+    cv2.imshow("AirCommander - Phase 3", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
