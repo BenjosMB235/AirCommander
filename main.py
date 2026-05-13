@@ -1,5 +1,5 @@
-# main.py — AirCommander Phase 3
-# Objectif : contrôler la souris avec les gestes de la main
+# main.py — AirCommander Phase 4
+# Nouveautés : gesture buffer, stabilisation, HUD amélioré
 
 import os
 os.environ["GLOG_minloglevel"] = "3"
@@ -12,18 +12,15 @@ from mediapipe.tasks.python import vision
 import math
 import pyautogui
 import time
+from collections import deque
 
-# Désactive la protection anti-crash de pyautogui (déplacer souris vers coin = stop)
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0  # Pas de délai entre les actions
+pyautogui.PAUSE = 0
 
-# --- Résolution de l'écran ---
 SCREEN_W, SCREEN_H = pyautogui.size()
-print(f"Résolution écran : {SCREEN_W}x{SCREEN_H}")
 
 # --- Modèle ---
 MODEL_PATH = "hand_landmarker.task"
-
 base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
@@ -46,27 +43,35 @@ CONNECTIONS = [
 ]
 
 # ─────────────────────────────────────────────
-# PARAMÈTRES DE CONTRÔLE
+# PARAMÈTRES
 # ─────────────────────────────────────────────
 
-PINCH_THRESHOLD = 0.09      # Seuil de détection du pinch
-DEAD_ZONE       = 0.005     # Mouvement minimum pour bouger la souris
-EMA_ALPHA       = 0.5       # Lissage (0.1 = très lissé, 1.0 = brut)
-CLICK_COOLDOWN  = 0.5       # Délai minimum entre deux clics (secondes)
+PINCH_THRESHOLD  = 0.09
+DEAD_ZONE        = 0.005
+EMA_ALPHA        = 0.5
+SPEED_FACTOR     = 1.8
+CLICK_COOLDOWN   = 0.5
+BUFFER_SIZE      = 5     # Nombre de frames pour valider un geste
+BUFFER_THRESHOLD = 4     # Nombre minimum de frames identiques pour valider
 
 # ─────────────────────────────────────────────
 # ÉTAT GLOBAL
 # ─────────────────────────────────────────────
 
-# Position lissée du curseur (coordonnées normalisées 0-1)
-smooth_x, smooth_y = 0.5, 0.5
+smooth_x, smooth_y   = 0.5, 0.5
+prev_wrist_y         = None
+last_left_click      = 0
+last_right_click     = 0
 
-# Pour le scroll : position y précédente du poignet
-prev_wrist_y = None
+# Gesture buffer : file des BUFFER_SIZE derniers gestes détectés
+gesture_buffer       = deque(maxlen=BUFFER_SIZE)
+stable_gesture       = "UNKNOWN"   # Geste validé après stabilisation
 
-# Timestamps des derniers clics (anti-spam)
-last_left_click  = 0
-last_right_click = 0
+# Historique des gestes validés (pour affichage HUD)
+gesture_history      = deque(maxlen=3)
+
+# FPS
+fps_times            = deque(maxlen=30)
 
 # ─────────────────────────────────────────────
 # FONCTIONS
@@ -74,13 +79,8 @@ last_right_click = 0
 
 def get_fingers_state(landmarks):
     fingers = []
-    thumb_tip = landmarks[4]
-    thumb_ip  = landmarks[3]
-    fingers.append(thumb_tip.x < thumb_ip.x)
-
-    finger_tips = [8, 12, 16, 20]
-    finger_pips = [6, 10, 14, 18]
-    for tip, pip in zip(finger_tips, finger_pips):
+    fingers.append(landmarks[4].x < landmarks[3].x)
+    for tip, pip in zip([8,12,16,20], [6,10,14,18]):
         fingers.append(landmarks[tip].y < landmarks[pip].y)
     return fingers
 
@@ -103,44 +103,87 @@ def detect_gesture(landmarks):
         return "VICTORY", fingers
     if fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
         return "POINTING", fingers
-    if fingers[0] and not fingers[1] and not fingers[2] and not fingers[3] and not fingers[4]:
+    if fingers[0] and not any(fingers[1:]):
         return "THUMBS_UP", fingers
     if fingers[1] and fingers[2] and fingers[3] and not fingers[4]:
         return "THREE", fingers
-    if not fingers[0] and fingers[1] and fingers[2] and fingers[3] and fingers[4]:
+    if not fingers[0] and all(fingers[1:]):
         return "FOUR", fingers
     return "UNKNOWN", fingers
 
 
+def stabilize_gesture(raw_gesture):
+    """
+    Ajoute le geste brut au buffer et retourne le geste stable
+    seulement si BUFFER_THRESHOLD frames consécutives sont identiques.
+    """
+    gesture_buffer.append(raw_gesture)
+
+    if len(gesture_buffer) < BUFFER_SIZE:
+        return stable_gesture  # Pas encore assez de données
+
+    # Compter les occurrences du geste le plus fréquent dans le buffer
+    counts = {}
+    for g in gesture_buffer:
+        counts[g] = counts.get(g, 0) + 1
+    most_common = max(counts, key=counts.get)
+
+    if counts[most_common] >= BUFFER_THRESHOLD:
+        return most_common
+    return stable_gesture  # Pas assez stable → garder le geste précédent
+
+
 def apply_ema(new_x, new_y, old_x, old_y, alpha):
-    """Lissage exponentiel : réduit le tremblement du curseur."""
-    sx = alpha * new_x + (1 - alpha) * old_x
-    sy = alpha * new_y + (1 - alpha) * old_y
-    return sx, sy
+    return alpha * new_x + (1-alpha) * old_x, alpha * new_y + (1-alpha) * old_y
 
 
 def move_cursor(norm_x, norm_y):
-    """Convertit les coordonnées normalisées en pixels écran et déplace la souris."""
-    # Le centre de la webcam (0.5, 0.5) correspond au centre de l'écran
-    # On amplifie les déplacements depuis le centre avec SPEED_FACTOR
-    SPEED_FACTOR = 1.8
-    centered_x = (norm_x - 0.5) * SPEED_FACTOR + 0.5
-    centered_y = (norm_y - 0.5) * SPEED_FACTOR + 0.5
+    cx = (norm_x - 0.5) * SPEED_FACTOR + 0.5
+    cy = (norm_y - 0.5) * SPEED_FACTOR + 0.5
+    sx = max(0, min(SCREEN_W-1, int(cx * SCREEN_W)))
+    sy = max(0, min(SCREEN_H-1, int(cy * SCREEN_H)))
+    pyautogui.moveTo(sx, sy)
 
-    screen_x = int(centered_x * SCREEN_W)
-    screen_y = int(centered_y * SCREEN_H)
-    # Clamp pour rester dans les limites de l'écran
-    screen_x = max(0, min(SCREEN_W - 1, screen_x))
-    screen_y = max(0, min(SCREEN_H - 1, screen_y))
-    pyautogui.moveTo(screen_x, screen_y)
+
+def draw_hud(frame, gesture, action_text, pinch_dist, fps):
+    """Dessine le HUD en bas de la fenêtre."""
+    h, w, _ = frame.shape
+
+    # Fond semi-transparent en bas
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, h-110), (w, h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    # Geste actif
+    color = GESTURE_COLORS.get(gesture, (150,150,150))
+    cv2.putText(frame, f"{gesture}", (15, h-75),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 2)
+
+    # Action en cours
+    cv2.putText(frame, action_text, (15, h-45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+
+    # Historique des gestes
+    history_text = "  >  ".join(gesture_history)
+    cv2.putText(frame, history_text, (15, h-18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
+
+    # FPS (coin supérieur droit)
+    cv2.putText(frame, f"FPS: {fps:.0f}", (w-100, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+
+    # Barre pinch (coin supérieur droit)
+    ratio = min(pinch_dist / PINCH_THRESHOLD, 1.0)
+    bar_color = (0, int(255*(1-ratio)), int(255*ratio))
+    cv2.rectangle(frame, (w-110, 45), (w-10, 58), (50,50,50), -1)
+    cv2.rectangle(frame, (w-110, 45), (w-10+int(-100*(1-ratio)), 58), bar_color, -1)
+    cv2.putText(frame, "PINCH", (w-110, 72),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180,180,180), 1)
 
 
 # ─────────────────────────────────────────────
 # BOUCLE PRINCIPALE
 # ─────────────────────────────────────────────
-
-cap = cv2.VideoCapture(0)
-frame_index = 0
 
 GESTURE_COLORS = {
     "PINCH":     (0, 255, 0),
@@ -154,14 +197,16 @@ GESTURE_COLORS = {
     "UNKNOWN":   (150, 150, 150)
 }
 
-print("AirCommander Phase 3 — Contrôle souris actif")
-print("  POINTING   → déplacer le curseur")
-print("  PINCH      → clic gauche")
-print("  VICTORY    → clic droit")
-print("  FIST       → scroll (bouge la main haut/bas)")
-print("  Appuie sur 'q' pour quitter")
+cap = cv2.VideoCapture(0)
+frame_index = 0
+
+print("AirCommander Phase 4 — HUD & Stabilisation")
+print("  POINTING → curseur | PINCH → clic G | VICTORY → clic D | FIST → scroll")
+print("  'q' pour quitter")
 
 while True:
+    t_start = time.time()
+
     success, frame = cap.read()
     if not success:
         break
@@ -179,93 +224,88 @@ while True:
 
     result = detector.detect_for_video(mp_image, timestamp_ms)
 
-    action_text = ""  # Message d'action affiché à l'écran
+    action_text  = ""
+    pinch_dist   = 1.0
 
     if result.hand_landmarks:
         landmarks = result.hand_landmarks[0]
         points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
 
-        gesture, fingers = detect_gesture(landmarks)
-        color = GESTURE_COLORS[gesture]
+        # Geste brut → stabilisation
+        raw_gesture, fingers = detect_gesture(landmarks)
+        new_stable = stabilize_gesture(raw_gesture)
 
-        # Position brute de l'index (landmark 8) pour le curseur
-        raw_x = landmarks[8].x
-        raw_y = landmarks[8].y
+        # Mettre à jour l'historique si le geste change
+        if new_stable != stable_gesture and new_stable != "UNKNOWN":
+            gesture_history.append(new_stable)
+        stable_gesture = new_stable
 
-        # ── POINTING : déplacer le curseur ──
-        if gesture == "POINTING":
-            # Appliquer le lissage EMA
-            smooth_x, smooth_y = apply_ema(raw_x, raw_y, smooth_x, smooth_y, EMA_ALPHA)
+        color = GESTURE_COLORS.get(stable_gesture, (150,150,150))
+        pinch_dist = get_distance(landmarks[4], landmarks[8])
 
-            # Appliquer la dead zone
-            dist_moved = math.sqrt((raw_x - smooth_x)**2 + (raw_y - smooth_y)**2)
-            if dist_moved > DEAD_ZONE:
+        # ── Actions selon geste stable ──
+
+        if stable_gesture == "POINTING":
+            smooth_x, smooth_y = apply_ema(
+                landmarks[8].x, landmarks[8].y,
+                smooth_x, smooth_y, EMA_ALPHA
+            )
+            dist = math.sqrt((landmarks[8].x - smooth_x)**2 + (landmarks[8].y - smooth_y)**2)
+            if dist > DEAD_ZONE:
                 move_cursor(smooth_x, smooth_y)
+            action_text = "Deplacement curseur"
 
-            action_text = "MODE : Deplacement curseur"
-
-        # ── PINCH : clic gauche ──
-        elif gesture == "PINCH":
+        elif stable_gesture == "PINCH":
             now = time.time()
             if now - last_left_click > CLICK_COOLDOWN:
                 pyautogui.click()
                 last_left_click = now
                 action_text = ">>> CLIC GAUCHE <<<"
             else:
-                action_text = "PINCH detecte (cooldown...)"
+                action_text = "Clic gauche (cooldown)"
 
-        # ── VICTORY : clic droit ──
-        elif gesture == "VICTORY":
+        elif stable_gesture == "VICTORY":
             now = time.time()
             if now - last_right_click > CLICK_COOLDOWN:
                 pyautogui.rightClick()
                 last_right_click = now
                 action_text = ">>> CLIC DROIT <<<"
             else:
-                action_text = "VICTORY detecte (cooldown...)"
+                action_text = "Clic droit (cooldown)"
 
-        # ── FIST : scroll ──
-        elif gesture == "FIST":
-            wrist_y = landmarks[0].y  # Landmark 0 = poignet
+        elif stable_gesture == "FIST":
+            wrist_y = landmarks[0].y
             if prev_wrist_y is not None:
                 delta_y = wrist_y - prev_wrist_y
-                # delta_y positif = main descend → scroll vers le bas
-                if abs(delta_y) > 0.005:  # Seuil minimal de mouvement
-                    scroll_amount = int(delta_y * -200)  # Inverser pour sens naturel
+                if abs(delta_y) > 0.005:
+                    scroll_amount = int(delta_y * -200)
                     pyautogui.scroll(scroll_amount)
-                    action_text = f"SCROLL {'↑' if scroll_amount > 0 else '↓'} ({scroll_amount})"
+                    action_text = f"SCROLL {'↑' if scroll_amount > 0 else '↓'}"
             prev_wrist_y = wrist_y
 
         else:
-            prev_wrist_y = None  # Reset scroll si autre geste
+            prev_wrist_y = None
 
-        # Dessiner le squelette
+        # Squelette
         for start, end in CONNECTIONS:
             cv2.line(frame, points[start], points[end], color, 2)
         for x, y in points:
             cv2.circle(frame, (x, y), 4, color, -1)
 
-        # Affichage HUD
-        cv2.putText(frame, f"Geste : {gesture}", (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        cv2.putText(frame, action_text, (10, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-        # Barre pinch
-        pinch_dist = get_distance(landmarks[4], landmarks[8])
-        ratio = min(pinch_dist / PINCH_THRESHOLD, 1.0)
-        bar_color = (0, int(255 * (1 - ratio)), int(255 * ratio))
-        cv2.rectangle(frame, (10, 115), (210, 130), (50, 50, 50), -1)
-        cv2.rectangle(frame, (10, 115), (10 + int(200 * ratio), 130), bar_color, -1)
-        cv2.putText(frame, f"Pinch: {pinch_dist:.3f}", (10, 112),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-
     else:
+        stable_gesture = stabilize_gesture("UNKNOWN")
+        prev_wrist_y   = None
         cv2.putText(frame, "Aucune main", (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        prev_wrist_y = None
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
 
-    cv2.imshow("AirCommander - Phase 3", frame)
+    # FPS
+    fps_times.append(time.time() - t_start)
+    fps = 1.0 / (sum(fps_times) / len(fps_times)) if fps_times else 0
+
+    # HUD
+    draw_hud(frame, stable_gesture, action_text, pinch_dist, fps)
+
+    cv2.imshow("AirCommander - Phase 4", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
