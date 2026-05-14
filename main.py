@@ -45,14 +45,25 @@ CONNECTIONS = [
 # ─────────────────────────────────────────────
 # PARAMÈTRES
 # ─────────────────────────────────────────────
+import json
+from gesture_utils import normalize_landmarks, detect_gesture_rules
 
-PINCH_THRESHOLD  = 0.09
-DEAD_ZONE        = 0.005
-EMA_ALPHA        = 0.5
-SPEED_FACTOR     = 1.8
-CLICK_COOLDOWN   = 0.5
-BUFFER_SIZE      = 5     # Nombre de frames pour valider un geste
-BUFFER_THRESHOLD = 4     # Nombre minimum de frames identiques pour valider
+# Charger la config (calibrée ou par défaut)
+if os.path.exists("config.json"):
+    with open("config.json") as f:
+        cfg = json.load(f)
+    print("✅ Config calibrée chargée")
+else:
+    cfg = {}
+    print("⚠️  Aucun calibrage trouvé — valeurs par défaut utilisées")
+
+PINCH_THRESHOLD  = cfg.get("pinch_threshold", 0.09)
+DEAD_ZONE        = cfg.get("dead_zone", 0.005)
+EMA_ALPHA        = cfg.get("ema_alpha", 0.5)
+SPEED_FACTOR     = cfg.get("speed_factor", 1.8)
+CLICK_COOLDOWN   = cfg.get("click_cooldown", 0.5)
+BUFFER_SIZE      = cfg.get("buffer_size", 5)
+BUFFER_THRESHOLD = cfg.get("buffer_threshold", 4)
 
 # ─────────────────────────────────────────────
 # ÉTAT GLOBAL
@@ -219,8 +230,7 @@ while True:
 
     timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
     if timestamp_ms == 0:
-        timestamp_ms = frame_index * 33
-    frame_index += 1
+        timestamp_ms = int(time.time() * 1000)  # Temps réel en millisecondes
 
     result = detector.detect_for_video(mp_image, timestamp_ms)
 
@@ -232,7 +242,7 @@ while True:
         points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
 
         # Geste brut → stabilisation
-        raw_gesture, fingers = detect_gesture(landmarks)
+        raw_gesture, fingers = detect_gesture_rules(landmarks, PINCH_THRESHOLD)
         new_stable = stabilize_gesture(raw_gesture)
 
         # Mettre à jour l'historique si le geste change
